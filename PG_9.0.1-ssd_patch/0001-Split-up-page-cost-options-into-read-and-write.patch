@@ -1,0 +1,926 @@
+Date: Tue, 18 Jan 2011 01:43:50 +0100
+Subject: [PATCH 1/9] Split up page cost options into read and write
+
+This allows better adaption to devices with asymmetric response times
+when it comes to reading and writing.  SSDs and PCMs are such devices.
+
+New page cost parameters replace the old ones preserving their semantic.
+If in the previous version an occourence of seq_page_cost modeled a read
+operation then it is replaced by this commit with seq_read_page_cost,
+otherwise, if that reference to seq_page_cost modeled a write operation
+it is replaced with seq_write_page_cost.  The same logic is used to
+replace random_page_cost with random_read_page_cost or
+random_write_page_cost respectively.
+
+This is a shorter version of the longer change 9b13c68 against the
+master branch.  It does not change the function gincostestimate in
+selfuncs.c because in 9.0.1 that function contains a call to
+genericcostestimate only while in master it is hand coded and contains
+references to the page cost variables.
+---
+ doc/src/sgml/config.sgml                      |  75 +++++++++++++---
+ doc/src/sgml/indexam.sgml                     |  18 ++--
+ doc/src/sgml/perform.sgml                     |  19 ++--
+ doc/src/sgml/ref/alter_tablespace.sgml        |  12 +--
+ doc/src/sgml/release-8.2.sgml                 |   4 +-
+ src/backend/access/common/reloptions.c        |   8 +-
+ src/backend/optimizer/path/costsize.c         | 123 +++++++++++++++-----------
+ src/backend/utils/adt/selfuncs.c              |  16 ++--
+ src/backend/utils/cache/spccache.c            |  20 ++---
+ src/backend/utils/misc/guc.c                  |  30 +++++--
+ src/backend/utils/misc/postgresql.conf.sample |   6 +-
+ src/bin/psql/tab-complete.c                   |   2 +-
+ src/include/commands/tablespace.h             |   4 +-
+ src/include/optimizer/cost.h                  |  12 ++-
+ src/include/utils/spccache.h                  |   4 +-
+ src/test/regress/input/tablespace.source      |   6 +-
+ src/test/regress/output/tablespace.source     |   6 +-
+ 17 files changed, 230 insertions(+), 135 deletions(-)
+
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index 39be624..4fdd48b 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -2264,7 +2264,7 @@ SET ENABLE_SEQSCAN TO OFF;
+      scaling them all up or down by the same factor will result in no change
+      in the planner's choices.  By default, these cost variables are based on
+      the cost of sequential page fetches; that is,
+-     <varname>seq_page_cost</> is conventionally set to <literal>1.0</>
++     <varname>seq_read_page_cost</> is conventionally set to <literal>1.0</>
+      and the other cost variables are set with reference to that.  But
+      you can use a different scale if you prefer, such as actual execution
+      times in milliseconds on a particular machine.
+@@ -2282,10 +2282,10 @@ SET ENABLE_SEQSCAN TO OFF;
+ 
+      <variablelist>
+ 
+-     <varlistentry id="guc-seq-page-cost" xreflabel="seq_page_cost">
+-      <term><varname>seq_page_cost</varname> (<type>floating point</type>)</term>
++     <varlistentry id="guc-seq-read-page-cost" xreflabel="seq_read_page_cost">
++      <term><varname>seq_read_page_cost</varname> (<type>floating point</type>)</term>
+       <indexterm>
+-       <primary><varname>seq_page_cost</> configuration parameter</primary>
++       <primary><varname>seq_read_page_cost</> configuration parameter</primary>
+       </indexterm>
+       <listitem>
+        <para>
+@@ -2298,10 +2298,10 @@ SET ENABLE_SEQSCAN TO OFF;
+       </listitem>
+      </varlistentry>
+ 
+-     <varlistentry id="guc-random-page-cost" xreflabel="random_page_cost">
+-      <term><varname>random_page_cost</varname> (<type>floating point</type>)</term>
++     <varlistentry id="guc-random-read-page-cost" xreflabel="random_read_page_cost">
++      <term><varname>random_read_page_cost</varname> (<type>floating point</type>)</term>
+       <indexterm>
+-       <primary><varname>random_page_cost</> configuration parameter</primary>
++       <primary><varname>random_read_page_cost</> configuration parameter</primary>
+       </indexterm>
+       <listitem>
+        <para>
+@@ -2313,7 +2313,7 @@ SET ENABLE_SEQSCAN TO OFF;
+        </para>
+ 
+        <para>
+-        Reducing this value relative to <varname>seq_page_cost</>
++        Reducing this value relative to <varname>seq_read_page_cost</>
+         will cause the system to prefer index scans; raising it will
+         make index scans look relatively more expensive.  You can raise
+         or lower both values together to change the importance of disk I/O
+@@ -2323,8 +2323,8 @@ SET ENABLE_SEQSCAN TO OFF;
+ 
+        <tip>
+         <para>
+-         Although the system will let you set <varname>random_page_cost</> to
+-         less than <varname>seq_page_cost</>, it is not physically sensible
++         Although the system will let you set <varname>random_read_page_cost</> to
++         less than <varname>seq_read-page_cost</>, it is not physically sensible
+          to do so.  However, setting them equal makes sense if the database
+          is entirely cached in RAM, since in that case there is no penalty
+          for touching pages out of sequence.  Also, in a heavily-cached
+@@ -2336,6 +2336,61 @@ SET ENABLE_SEQSCAN TO OFF;
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry id="guc-seq-write-page-cost" xreflabel="seq_write_page_cost">
++      <term><varname>seq_write_page_cost</varname> (<type>floating point</type>)</term>
++      <indexterm>
++       <primary><varname>seq_write_page_cost</> configuration parameter</primary>
++      </indexterm>
++      <listitem>
++       <para>
++        Sets the planner's estimate of the cost of a disk page write
++        that is part of a series of sequential writes.  The default is 1.0,
++		what assumes a symmetric performing storage device like a hard disk
++		drive.
++       </para>
++       <tip>
++        <para>When the database resides on a asymmetric memory device like a
++		  flash SSD or an even more modern phase change memory device, you
++		  should increase this value, to prefer plans, that do not write
++		  intermediate results.
++        </para>
++       </tip>
++       <para>
++        This value can be overridden for a particular tablespace by setting
++        the tablespace parameter of the same name
++        (see <xref linkend="sql-altertablespace">).
++       </para>
++      </listitem>
++     </varlistentry>
++
++     <varlistentry id="guc-random-write-page-cost" xreflabel="random_write_page_cost">
++      <term><varname>random_write_page_cost</varname> (<type>floating point</type>)</term>
++      <indexterm>
++       <primary><varname>random_write_page_cost</> configuration parameter</primary>
++      </indexterm>
++      <listitem>
++       <para>
++        Sets the planner's estimate of the cost of a non-sequentially-written
++        disk page.  The default is 4.0, what assumes a symmetric performing
++        storage device like a hard disk drive.
++       </para>
++       <tip>
++        <para>When the database resides on a asymmetric memory device like a
++		  flash SSD or an even more modern phase change memory device, you
++		  should increase this value, to prefer plans, that do not write
++		  intermediate results.  Random writes on such a device are usually
++		  slower than sequential writes, so plans using such operations
++		  intensively should be avoided.
++        </para>
++       </tip>
++	   <para>
++        This value can be overridden for a particular tablespace by setting
++        the tablespace parameter of the same name
++        (see <xref linkend="sql-altertablespace">).
++       </para>
++      </listitem>
++     </varlistentry>
++
+      <varlistentry id="guc-cpu-tuple-cost" xreflabel="cpu_tuple_cost">
+       <term><varname>cpu_tuple_cost</varname> (<type>floating point</type>)</term>
+       <indexterm>
+diff --git a/doc/src/sgml/indexam.sgml b/doc/src/sgml/indexam.sgml
+index a17a4fd..3bb86ba 100644
+--- a/doc/src/sgml/indexam.sgml
++++ b/doc/src/sgml/indexam.sgml
+@@ -946,9 +946,11 @@ amcostestimate (PlannerInfo *root,
+   <para>
+    The index access costs should be computed using the parameters used by
+    <filename>src/backend/optimizer/path/costsize.c</filename>: a sequential
+-   disk block fetch has cost <varname>seq_page_cost</>, a nonsequential fetch
+-   has cost <varname>random_page_cost</>, and the cost of processing one index
+-   row should usually be taken as <varname>cpu_index_tuple_cost</>.  In
++   disk block fetch has cost <varname>seq_read_page_cost</>, a nonsequential
++   fetch has cost <varname>random_read_page_cost</> while disk writes are
++   represented by <varname>seq_write_page_cost</>
++   and <varname>random_write_page_cost</>.  The cost of processing one index
++   row should usually be taken as <varname>cpu_index_tuple_cost</>, and in
+    addition, an appropriate multiple of <varname>cpu_operator_cost</> should
+    be charged for any comparison operators invoked during index processing
+    (especially evaluation of the <literal>indexQuals</> themselves).
+@@ -1028,14 +1030,14 @@ amcostestimate (PlannerInfo *root,
+ 
+ <programlisting>
+ /*
+- * Our generic assumption is that the index pages will be read
+- * sequentially, so they cost seq_page_cost each, not random_page_cost.
+- * Also, we charge for evaluation of the indexquals at each index row.
+- * All the costs are assumed to be paid incrementally during the scan.
++ * Our generic assumption is that the index pages will be read sequentially,
++ * so they cost seq_read_page_cost each, not random_read_page_cost.  Also,
++ * we charge for evaluation of the indexquals at each index row.  All the
++ * costs are assumed to be paid incrementally during the scan.
+  */
+ cost_qual_eval(&amp;index_qual_cost, indexQuals, root);
+ *indexStartupCost = index_qual_cost.startup;
+-*indexTotalCost = seq_page_cost * numIndexPages +
++*indexTotalCost = seq_read_page_cost * numIndexPages +
+     (cpu_index_tuple_cost + index_qual_cost.per_tuple) * numIndexTuples;
+ </programlisting>
+ 
+diff --git a/doc/src/sgml/perform.sgml b/doc/src/sgml/perform.sgml
+index 4307370..df76c5d 100644
+--- a/doc/src/sgml/perform.sgml
++++ b/doc/src/sgml/perform.sgml
+@@ -115,13 +115,12 @@ EXPLAIN SELECT * FROM tenk1;
+    </para>
+ 
+    <para>
+-    The costs are measured in arbitrary units determined by the planner's
+-    cost parameters (see <xref linkend="runtime-config-query-constants">).
+-    Traditional practice is to measure the costs in units of disk page
+-    fetches; that is, <xref linkend="guc-seq-page-cost"> is conventionally
+-    set to <literal>1.0</> and the other cost parameters are set relative
+-    to that.  (The examples in this section are run with the default cost
+-    parameters.)
++    The costs are measured in arbitrary units determined by the planner's cost
++    parameters (see <xref linkend="runtime-config-query-constants">).
++    Traditional practice is to measure the costs in units of disk page fetches;
++    that is, <xref linkend="guc-seq-read-page-cost"> is conventionally set
++    to <literal>1.0</> and the other cost parameters are set relative to that.
++    (The examples in this section are run with the default cost parameters.)
+    </para>
+ 
+    <para>
+@@ -167,10 +166,10 @@ SELECT relpages, reltuples FROM pg_class WHERE relname = 'tenk1';
+ 
+     you will find that <classname>tenk1</classname> has 358 disk
+     pages and 10000 rows.  The estimated cost is computed as (disk pages read *
+-    <xref linkend="guc-seq-page-cost">) + (rows scanned *
++    <xref linkend="guc-seq-read-page-cost">) + (rows scanned *
+     <xref linkend="guc-cpu-tuple-cost">).  By default,
+-    <varname>seq_page_cost</> is 1.0 and <varname>cpu_tuple_cost</> is 0.01,
+-    so the estimated cost is (358 * 1.0) + (10000 * 0.01) = 458.
++    <varname>seq_read_page_cost</> is 1.0 and <varname>cpu_tuple_cost</> is
++    0.01, so the estimated cost is (358 * 1.0) + (10000 * 0.01) = 458.
+    </para>
+ 
+    <para>
+diff --git a/doc/src/sgml/ref/alter_tablespace.sgml b/doc/src/sgml/ref/alter_tablespace.sgml
+index d778992..0d33c4c 100644
+--- a/doc/src/sgml/ref/alter_tablespace.sgml
++++ b/doc/src/sgml/ref/alter_tablespace.sgml
+@@ -82,13 +82,13 @@ ALTER TABLESPACE <replaceable>name</replaceable> RESET ( <replaceable class="PAR
+     <listitem>
+      <para>
+       A tablespace parameter to be set or reset.  Currently, the only
+-      available parameters are <varname>seq_page_cost</> and
+-      <varname>random_page_cost</>.  Setting either value for a particular
+-      tablespace will override the planner's usual estimate of the cost of
+-      reading pages from tables in that tablespace, as established by
++      available parameters are <varname>seq_read_page_cost</> and
++      <varname>random_read_page_cost</>.  Setting either value for a
++      particular tablespace will override the planner's usual estimate of the
++      cost of reading pages from tables in that tablespace, as established by
+       the configuration parameters of the same name (see
+-      <xref linkend="guc-seq-page-cost">,
+-      <xref linkend="guc-random-page-cost">).  This may be useful if one
++      <xref linkend="guc-seq-read-page-cost">,
++      <xref linkend="guc-random-read-page-cost">).  This may be useful if one
+       tablespace is located on a disk which is faster or slower than the
+       remainder of the I/O subsystem.
+      </para>
+diff --git a/doc/src/sgml/release-8.2.sgml b/doc/src/sgml/release-8.2.sgml
+index 89431c3..3a0dea2 100644
+--- a/doc/src/sgml/release-8.2.sgml
++++ b/doc/src/sgml/release-8.2.sgml
+@@ -3814,7 +3814,7 @@
+       <para>
+        This might eliminate the need to set unrealistically small
+        values of <link
+-       linkend="guc-random-page-cost"><varname>random_page_cost</></link>.
++       linkend="guc-random-read-page-cost"><varname>random_page_cost</></link>.
+        If you have been using a very small <varname>random_page_cost</>,
+        please recheck your test cases.
+       </para>
+@@ -5769,7 +5769,7 @@
+      <listitem>
+       <para>
+        Add a configuration parameter <link
+-       linkend="guc-seq-page-cost"><varname>seq_page_cost</></link>
++       linkend="guc-seq-read-page-cost"><varname>seq_page_cost</></link>
+        (Tom)
+       </para>
+      </listitem>
+diff --git a/src/backend/access/common/reloptions.c b/src/backend/access/common/reloptions.c
+index cd4f590..4b52850 100644
+--- a/src/backend/access/common/reloptions.c
++++ b/src/backend/access/common/reloptions.c
+@@ -183,7 +183,7 @@ static relopt_real realRelOpts[] =
+ 	},
+ 	{
+ 		{
+-			"seq_page_cost",
++			"seq_read_page_cost",
+ 			"Sets the planner's estimate of the cost of a sequentially fetched disk page.",
+ 			RELOPT_KIND_TABLESPACE
+ 		},
+@@ -191,7 +191,7 @@ static relopt_real realRelOpts[] =
+ 	},
+ 	{
+ 		{
+-			"random_page_cost",
++			"random_read_page_cost",
+ 			"Sets the planner's estimate of the cost of a nonsequentially fetched disk page.",
+ 			RELOPT_KIND_TABLESPACE
+ 		},
+@@ -1259,8 +1259,8 @@ tablespace_reloptions(Datum reloptions, bool validate)
+ 	TableSpaceOpts *tsopts;
+ 	int			numoptions;
+ 	static const relopt_parse_elt tab[] = {
+-		{"random_page_cost", RELOPT_TYPE_REAL, offsetof(TableSpaceOpts, random_page_cost)},
+-		{"seq_page_cost", RELOPT_TYPE_REAL, offsetof(TableSpaceOpts, seq_page_cost)}
++		{"random_read_page_cost", RELOPT_TYPE_REAL, offsetof(TableSpaceOpts, random_read_page_cost)},
++		{"seq_read_page_cost", RELOPT_TYPE_REAL, offsetof(TableSpaceOpts, seq_read_page_cost)}
+ 	};
+ 
+ 	options = parseRelOptions(reloptions, validate, RELOPT_KIND_TABLESPACE,
+diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
+index 6f16eb8..7a3beaa 100644
+--- a/src/backend/optimizer/path/costsize.c
++++ b/src/backend/optimizer/path/costsize.c
+@@ -6,16 +6,22 @@
+  * Path costs are measured in arbitrary units established by these basic
+  * parameters:
+  *
+- *	seq_page_cost		Cost of a sequential page fetch
+- *	random_page_cost	Cost of a non-sequential page fetch
++ *	seq_read_page_cost		Cost of a sequential page fetch
++ *	random_read_page_cost	Cost of a non-sequential page fetch
++ *	seq_write_page_cost		Cost of a sequential page storage
++ *	random_write_page_cost	Cost of a non-sequential page storage
+  *	cpu_tuple_cost		Cost of typical CPU time to process a tuple
+  *	cpu_index_tuple_cost  Cost of typical CPU time to process an index tuple
+  *	cpu_operator_cost	Cost of CPU time to execute an operator or function
+  *
+  * We expect that the kernel will typically do some amount of read-ahead
+- * optimization; this in conjunction with seek costs means that seq_page_cost
+- * is normally considerably less than random_page_cost.  (However, if the
+- * database is fully cached in RAM, it is reasonable to set them equal.)
++ * optimization; this in conjunction with seek costs means that
++ * seq_read_page_cost is normally considerably less than
++ * random_read_page_cost.  (However, if the database is fully cached in RAM,
++ * it is reasonable to set them equal.)  For an HDD it is normal to set the
++ * read and write costs equal as the question whether it needs to seek is
++ * dominant, for an SSD, however, the write costs and especially the random
++ * write costs are higher.
+  *
+  * We also use a rough estimate "effective_cache_size" of the number of
+  * disk pages in Postgres + OS-level disk cache.  (We can't simply use
+@@ -27,7 +33,7 @@
+  * detail.	Note that all of these parameters are user-settable, in case
+  * the default values are drastically off for a particular platform.
+  *
+- * seq_page_cost and random_page_cost can also be overridden for an individual
++ * the *_page_cost options can also be overridden for an individual
+  * tablespace, in case some data is on a fast disk and other data is on a slow
+  * disk.  Per-tablespace overrides never apply to temporary work files such as
+  * an external sort or a materialize node that overflows work_mem.
+@@ -97,8 +103,10 @@
+ 	 (path)->parent->rows)
+ 
+ 
+-double		seq_page_cost = DEFAULT_SEQ_PAGE_COST;
+-double		random_page_cost = DEFAULT_RANDOM_PAGE_COST;
++double		seq_read_page_cost = DEFAULT_SEQ_READ_PAGE_COST;
++double		random_read_page_cost = DEFAULT_RANDOM_READ_PAGE_COST;
++double		seq_write_page_cost = DEFAULT_SEQ_WRITE_PAGE_COST;
++double		random_write_page_cost = DEFAULT_RANDOM_WRITE_PAGE_COST;
+ double		cpu_tuple_cost = DEFAULT_CPU_TUPLE_COST;
+ double		cpu_index_tuple_cost = DEFAULT_CPU_INDEX_TUPLE_COST;
+ double		cpu_operator_cost = DEFAULT_CPU_OPERATOR_COST;
+@@ -171,7 +179,7 @@ void
+ cost_seqscan(Path *path, PlannerInfo *root,
+ 			 RelOptInfo *baserel)
+ {
+-	double		spc_seq_page_cost;
++	double		spc_seq_read_page_cost;
+ 	Cost		startup_cost = 0;
+ 	Cost		run_cost = 0;
+ 	Cost		cpu_per_tuple;
+@@ -186,12 +194,12 @@ cost_seqscan(Path *path, PlannerInfo *root,
+ 	/* fetch estimated page cost for tablespace containing table */
+ 	get_tablespace_page_costs(baserel->reltablespace,
+ 							  NULL,
+-							  &spc_seq_page_cost);
++							  &spc_seq_read_page_cost);
+ 
+ 	/*
+ 	 * disk costs
+ 	 */
+-	run_cost += spc_seq_page_cost * baserel->pages;
++	run_cost += spc_seq_read_page_cost * baserel->pages;
+ 
+ 	/* CPU costs */
+ 	startup_cost += baserel->baserestrictcost.startup;
+@@ -239,8 +247,8 @@ cost_index(IndexPath *path, PlannerInfo *root,
+ 	Selectivity indexSelectivity;
+ 	double		indexCorrelation,
+ 				csquared;
+-	double		spc_seq_page_cost,
+-				spc_random_page_cost;
++	double		spc_seq_read_page_cost,
++				spc_random_read_page_cost;
+ 	Cost		min_IO_cost,
+ 				max_IO_cost;
+ 	Cost		cpu_per_tuple;
+@@ -289,8 +297,8 @@ cost_index(IndexPath *path, PlannerInfo *root,
+ 
+ 	/* fetch estimated page costs for tablespace containing table */
+ 	get_tablespace_page_costs(baserel->reltablespace,
+-							  &spc_random_page_cost,
+-							  &spc_seq_page_cost);
++							  &spc_random_read_page_cost,
++							  &spc_seq_read_page_cost);
+ 
+ 	/*----------
+ 	 * Estimate number of main-table pages fetched, and compute I/O cost.
+@@ -298,7 +306,7 @@ cost_index(IndexPath *path, PlannerInfo *root,
+ 	 * When the index ordering is uncorrelated with the table ordering,
+ 	 * we use an approximation proposed by Mackert and Lohman (see
+ 	 * index_pages_fetched() for details) to compute the number of pages
+-	 * fetched, and then charge spc_random_page_cost per page fetched.
++	 * fetched, and then charge spc_random_read_page_cost per page fetched.
+ 	 *
+ 	 * When the index ordering is exactly correlated with the table ordering
+ 	 * (just after a CLUSTER, for example), the number of pages fetched should
+@@ -306,7 +314,8 @@ cost_index(IndexPath *path, PlannerInfo *root,
+ 	 * will be sequential fetches, not the random fetches that occur in the
+ 	 * uncorrelated case.  So if the number of pages is more than 1, we
+ 	 * ought to charge
+-	 *		spc_random_page_cost + (pages_fetched - 1) * spc_seq_page_cost
++	 *		spc_random_read_page_cost + 
++	 *		(pages_fetched - 1) * spc_seq_read_page_cost
+ 	 * For partially-correlated indexes, we ought to charge somewhere between
+ 	 * these two estimates.  We currently interpolate linearly between the
+ 	 * estimates based on the correlation squared (XXX is that appropriate?).
+@@ -329,7 +338,7 @@ cost_index(IndexPath *path, PlannerInfo *root,
+ 											(double) index->pages,
+ 											root);
+ 
+-		max_IO_cost = (pages_fetched * spc_random_page_cost) / num_scans;
++		max_IO_cost = (pages_fetched * spc_random_read_page_cost) / num_scans;
+ 
+ 		/*
+ 		 * In the perfectly correlated case, the number of pages touched by
+@@ -348,7 +357,7 @@ cost_index(IndexPath *path, PlannerInfo *root,
+ 											(double) index->pages,
+ 											root);
+ 
+-		min_IO_cost = (pages_fetched * spc_random_page_cost) / num_scans;
++		min_IO_cost = (pages_fetched * spc_random_read_page_cost) / num_scans;
+ 	}
+ 	else
+ 	{
+@@ -362,13 +371,13 @@ cost_index(IndexPath *path, PlannerInfo *root,
+ 											root);
+ 
+ 		/* max_IO_cost is for the perfectly uncorrelated case (csquared=0) */
+-		max_IO_cost = pages_fetched * spc_random_page_cost;
++		max_IO_cost = pages_fetched * spc_random_read_page_cost;
+ 
+ 		/* min_IO_cost is for the perfectly correlated case (csquared=1) */
+ 		pages_fetched = ceil(indexSelectivity * (double) baserel->pages);
+-		min_IO_cost = spc_random_page_cost;
++		min_IO_cost = spc_random_read_page_cost;
+ 		if (pages_fetched > 1)
+-			min_IO_cost += (pages_fetched - 1) * spc_seq_page_cost;
++			min_IO_cost += (pages_fetched - 1) * spc_seq_read_page_cost;
+ 	}
+ 
+ 	/*
+@@ -573,8 +582,8 @@ cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
+ 	Cost		cost_per_page;
+ 	double		tuples_fetched;
+ 	double		pages_fetched;
+-	double		spc_seq_page_cost,
+-				spc_random_page_cost;
++	double		spc_seq_read_page_cost,
++				spc_random_read_page_cost;
+ 	double		T;
+ 
+ 	/* Should only be applied to base relations */
+@@ -595,8 +604,8 @@ cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
+ 
+ 	/* Fetch estimated page costs for tablespace containing table. */
+ 	get_tablespace_page_costs(baserel->reltablespace,
+-							  &spc_random_page_cost,
+-							  &spc_seq_page_cost);
++							  &spc_random_read_page_cost,
++							  &spc_seq_read_page_cost);
+ 
+ 	/*
+ 	 * Estimate number of main-table pages fetched.
+@@ -636,18 +645,18 @@ cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
+ 		pages_fetched = ceil(pages_fetched);
+ 
+ 	/*
+-	 * For small numbers of pages we should charge spc_random_page_cost
++	 * For small numbers of pages we should charge spc_random_read_page_cost
+ 	 * apiece, while if nearly all the table's pages are being read, it's more
+-	 * appropriate to charge spc_seq_page_cost apiece.	The effect is
+-	 * nonlinear, too. For lack of a better idea, interpolate like this to
++	 * appropriate to charge spc_seq_read_page_cost apiece.  The effect is
++	 * nonlinear, too.  For lack of a better idea, interpolate like this to
+ 	 * determine the cost per page.
+ 	 */
+ 	if (pages_fetched >= 2.0)
+-		cost_per_page = spc_random_page_cost -
+-			(spc_random_page_cost - spc_seq_page_cost)
++		cost_per_page = spc_random_read_page_cost -
++			(spc_random_read_page_cost - spc_seq_read_page_cost)
+ 			* sqrt(pages_fetched / T);
+ 	else
+-		cost_per_page = spc_random_page_cost;
++		cost_per_page = spc_random_read_page_cost;
+ 
+ 	run_cost += pages_fetched * cost_per_page;
+ 
+@@ -811,7 +820,7 @@ cost_tidscan(Path *path, PlannerInfo *root,
+ 	QualCost	tid_qual_cost;
+ 	int			ntuples;
+ 	ListCell   *l;
+-	double		spc_random_page_cost;
++	double		spc_random_read_page_cost;
+ 
+ 	/* Should only be applied to base relations */
+ 	Assert(baserel->relid > 0);
+@@ -866,11 +875,11 @@ cost_tidscan(Path *path, PlannerInfo *root,
+ 
+ 	/* fetch estimated page cost for tablespace containing table */
+ 	get_tablespace_page_costs(baserel->reltablespace,
+-							  &spc_random_page_cost,
++							  &spc_random_read_page_cost,
+ 							  NULL);
+ 
+ 	/* disk costs --- assume each tuple on a different page */
+-	run_cost += spc_random_page_cost * ntuples;
++	run_cost += spc_random_read_page_cost * ntuples;
+ 
+ 	/* CPU costs */
+ 	startup_cost += baserel->baserestrictcost.startup +
+@@ -1088,8 +1097,10 @@ cost_recursive_union(Plan *runion, Plan *nrterm, Plan *rterm)
+  * and k tuples can fit into work_mem, we use a heap method that keeps only
+  * k tuples in the heap; this will require about t*log2(k) tuple comparisons.
+  *
+- * The disk traffic is assumed to be 3/4ths sequential and 1/4th random
+- * accesses (XXX can't we refine that guess?)
++ * The disk write traffic is assumed to be sequential as it goes to a single
++ * target tape.  The read accesses are assumed to be half random half
++ * sequential.  (XXX: A better guess could be based on the possible tape count
++ * and the merge buffer size.)
+  *
+  * We charge two operator evals per tuple comparison, which should be in
+  * the right ballpark in most cases.
+@@ -1150,7 +1161,6 @@ cost_sort(Path *path, PlannerInfo *root,
+ 		double		nruns = (input_bytes / work_mem_bytes) * 0.5;
+ 		double		mergeorder = tuplesort_merge_order(work_mem_bytes);
+ 		double		log_runs;
+-		double		npageaccesses;
+ 
+ 		/*
+ 		 * CPU costs
+@@ -1167,10 +1177,14 @@ cost_sort(Path *path, PlannerInfo *root,
+ 			log_runs = ceil(log(nruns) / log(mergeorder));
+ 		else
+ 			log_runs = 1.0;
+-		npageaccesses = 2.0 * npages * log_runs;
+-		/* Assume 3/4ths of accesses are sequential, 1/4th are not */
+-		startup_cost += npageaccesses *
+-			(seq_page_cost * 0.75 + random_page_cost * 0.25);
++		/* Assume all writes as sequential as they go to a single target
++		 * tape. */
++		startup_cost += npages * log_runs * seq_write_page_cost;
++		/* Assume half of reads as sequential and the other half as random.
++		 * They tend to start mostly sequential but more random in later runs
++		 * because of fragmentation in the temp file. */
++		startup_cost += npages * log_runs * 
++				(seq_read_page_cost + random_read_page_cost) * 0.5;
+ 	}
+ 	else if (tuples > 2 * output_tuples || input_bytes > work_mem_bytes)
+ 	{
+@@ -1239,16 +1253,16 @@ cost_material(Path *path,
+ 	run_cost += 2 * cpu_operator_cost * tuples;
+ 
+ 	/*
+-	 * If we will spill to disk, charge at the rate of seq_page_cost per page.
+-	 * This cost is assumed to be evenly spread through the plan run phase,
+-	 * which isn't exactly accurate but our cost model doesn't allow for
+-	 * nonuniform costs within the run phase.
++	 * If we will spill to disk, charge at the rate of seq_write_page_cost per
++	 * page.  This cost is assumed to be evenly spread through the plan run
++	 * phase, which isn't exactly accurate but our cost model doesn't allow
++	 * for nonuniform costs within the run phase.
+ 	 */
+ 	if (nbytes > work_mem_bytes)
+ 	{
+ 		double		npages = ceil(nbytes / BLCKSZ);
+ 
+-		run_cost += seq_page_cost * npages;
++		run_cost += seq_write_page_cost * npages;
+ 	}
+ 
+ 	path->startup_cost = startup_cost;
+@@ -2145,9 +2159,9 @@ cost_hashjoin(HashPath *path, PlannerInfo *root, SpecialJoinInfo *sjinfo)
+ 	/*
+ 	 * If inner relation is too big then we will need to "batch" the join,
+ 	 * which implies writing and reading most of the tuples to disk an extra
+-	 * time.  Charge seq_page_cost per page, since the I/O should be nice and
+-	 * sequential.	Writing the inner rel counts as startup cost, all the rest
+-	 * as run cost.
++	 * time.  Charge seq_*_page_cost per page, since the I/O should be nice
++	 * and sequential.  Writing the inner rel counts as startup cost, all the
++	 * rest as run cost.
+ 	 */
+ 	if (numbatches > 1)
+ 	{
+@@ -2156,8 +2170,9 @@ cost_hashjoin(HashPath *path, PlannerInfo *root, SpecialJoinInfo *sjinfo)
+ 		double		innerpages = page_size(inner_path_rows,
+ 										   inner_path->parent->width);
+ 
+-		startup_cost += seq_page_cost * innerpages;
+-		run_cost += seq_page_cost * (innerpages + 2 * outerpages);
++		startup_cost += seq_write_page_cost * innerpages;
++		run_cost += seq_read_page_cost * innerpages +
++				(seq_write_page_cost + seq_read_page_cost) * outerpages;
+ 	}
+ 
+ 	/* CPU costs */
+@@ -2397,7 +2412,7 @@ cost_rescan(PlannerInfo *root, Path *path,
+ 					/* It will spill, so account for re-read cost */
+ 					double		npages = ceil(nbytes / BLCKSZ);
+ 
+-					run_cost += seq_page_cost * npages;
++					run_cost += seq_read_page_cost * npages;
+ 				}
+ 				*rescan_startup_cost = 0;
+ 				*rescan_total_cost = run_cost;
+@@ -2424,7 +2439,7 @@ cost_rescan(PlannerInfo *root, Path *path,
+ 					/* It will spill, so account for re-read cost */
+ 					double		npages = ceil(nbytes / BLCKSZ);
+ 
+-					run_cost += seq_page_cost * npages;
++					run_cost += seq_read_page_cost * npages;
+ 				}
+ 				*rescan_startup_cost = 0;
+ 				*rescan_total_cost = run_cost;
+diff --git a/src/backend/utils/adt/selfuncs.c b/src/backend/utils/adt/selfuncs.c
+index 5925a91..ce63f58 100644
+--- a/src/backend/utils/adt/selfuncs.c
++++ b/src/backend/utils/adt/selfuncs.c
+@@ -5646,7 +5646,7 @@ genericcostestimate(PlannerInfo *root,
+ 	QualCost	index_qual_cost;
+ 	double		qual_op_cost;
+ 	double		qual_arg_cost;
+-	double		spc_random_page_cost;
++	double		spc_random_read_page_cost;
+ 	List	   *selectivityQuals;
+ 	ListCell   *l;
+ 
+@@ -5757,7 +5757,7 @@ genericcostestimate(PlannerInfo *root,
+ 
+ 	/* fetch estimated page cost for schema containing index */
+ 	get_tablespace_page_costs(index->reltablespace,
+-							  &spc_random_page_cost,
++							  &spc_random_read_page_cost,
+ 							  NULL);
+ 
+ 	/*
+@@ -5806,16 +5806,16 @@ genericcostestimate(PlannerInfo *root,
+ 		 * share for each outer scan.  (Don't pro-rate for ScalarArrayOpExpr,
+ 		 * since that's internal to the indexscan.)
+ 		 */
+-		*indexTotalCost = (pages_fetched * spc_random_page_cost)
++		*indexTotalCost = (pages_fetched * spc_random_read_page_cost)
+ 			/ num_outer_scans;
+ 	}
+ 	else
+ 	{
+ 		/*
+-		 * For a single index scan, we just charge spc_random_page_cost per
+-		 * page touched.
++		 * For a single index scan, we just charge spc_random_read_page_cost
++		 * per page touched.
+ 		 */
+-		*indexTotalCost = numIndexPages * spc_random_page_cost;
++		*indexTotalCost = numIndexPages * spc_random_read_page_cost;
+ 	}
+ 
+ 	/*
+@@ -5830,11 +5830,11 @@ genericcostestimate(PlannerInfo *root,
+ 	 *
+ 	 * We can deal with this by adding a very small "fudge factor" that
+ 	 * depends on the index size.  The fudge factor used here is one
+-	 * spc_random_page_cost per 100000 index pages, which should be small
++	 * spc_random_read_page_cost per 100000 index pages, which should be small
+ 	 * enough to not alter index-vs-seqscan decisions, but will prevent
+ 	 * indexes of different sizes from looking exactly equally attractive.
+ 	 */
+-	*indexTotalCost += index->pages * spc_random_page_cost / 100000.0;
++	*indexTotalCost += index->pages * spc_random_read_page_cost / 100000.0;
+ 
+ 	/*
+ 	 * CPU cost: any complex expressions in the indexquals will need to be
+diff --git a/src/backend/utils/cache/spccache.c b/src/backend/utils/cache/spccache.c
+index 3eaafe8..a1ece47 100644
+--- a/src/backend/utils/cache/spccache.c
++++ b/src/backend/utils/cache/spccache.c
+@@ -176,26 +176,26 @@ get_tablespace(Oid spcid)
+  */
+ void
+ get_tablespace_page_costs(Oid spcid,
+-						  double *spc_random_page_cost,
+-						  double *spc_seq_page_cost)
++						  double *spc_random_read_page_cost,
++						  double *spc_seq_read_page_cost)
+ {
+ 	TableSpaceCacheEntry *spc = get_tablespace(spcid);
+ 
+ 	Assert(spc != NULL);
+ 
+-	if (spc_random_page_cost)
++	if (spc_random_read_page_cost)
+ 	{
+-		if (!spc->opts || spc->opts->random_page_cost < 0)
+-			*spc_random_page_cost = random_page_cost;
++		if (!spc->opts || spc->opts->random_read_page_cost < 0)
++			*spc_random_read_page_cost = random_read_page_cost;
+ 		else
+-			*spc_random_page_cost = spc->opts->random_page_cost;
++			*spc_random_read_page_cost = spc->opts->random_read_page_cost;
+ 	}
+ 
+-	if (spc_seq_page_cost)
++	if (spc_seq_read_page_cost)
+ 	{
+-		if (!spc->opts || spc->opts->seq_page_cost < 0)
+-			*spc_seq_page_cost = seq_page_cost;
++		if (!spc->opts || spc->opts->seq_read_page_cost < 0)
++			*spc_seq_read_page_cost = seq_read_page_cost;
+ 		else
+-			*spc_seq_page_cost = spc->opts->seq_page_cost;
++			*spc_seq_read_page_cost = spc->opts->seq_read_page_cost;
+ 	}
+ }
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index 4e55b16..d77db80 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -2088,22 +2088,40 @@ static struct config_int ConfigureNamesInt[] =
+ static struct config_real ConfigureNamesReal[] =
+ {
+ 	{
+-		{"seq_page_cost", PGC_USERSET, QUERY_TUNING_COST,
++		{"seq_read_page_cost", PGC_USERSET, QUERY_TUNING_COST,
+ 			gettext_noop("Sets the planner's estimate of the cost of a "
+ 						 "sequentially fetched disk page."),
+ 			NULL
+ 		},
+-		&seq_page_cost,
+-		DEFAULT_SEQ_PAGE_COST, 0, DBL_MAX, NULL, NULL
++		&seq_read_page_cost,
++		DEFAULT_SEQ_READ_PAGE_COST, 0, DBL_MAX, NULL, NULL
+ 	},
+ 	{
+-		{"random_page_cost", PGC_USERSET, QUERY_TUNING_COST,
++		{"random_read_page_cost", PGC_USERSET, QUERY_TUNING_COST,
+ 			gettext_noop("Sets the planner's estimate of the cost of a "
+ 						 "nonsequentially fetched disk page."),
+ 			NULL
+ 		},
+-		&random_page_cost,
+-		DEFAULT_RANDOM_PAGE_COST, 0, DBL_MAX, NULL, NULL
++		&random_read_page_cost,
++		DEFAULT_RANDOM_READ_PAGE_COST, 0, DBL_MAX, NULL, NULL
++	},
++	{
++		{"seq_write_page_cost", PGC_USERSET, QUERY_TUNING_COST,
++			gettext_noop("Sets the planner's estimate of the cost of a "
++						 "sequentially stored disk page."),
++			NULL
++		},
++		&seq_write_page_cost,
++		DEFAULT_SEQ_WRITE_PAGE_COST, 0, DBL_MAX, NULL, NULL
++	},
++	{
++		{"random_write_page_cost", PGC_USERSET, QUERY_TUNING_COST,
++			gettext_noop("Sets the planner's estimate of the cost of a "
++						 "nonsequentially stored disk page."),
++			NULL
++		},
++		&random_write_page_cost,
++		DEFAULT_RANDOM_WRITE_PAGE_COST, 0, DBL_MAX, NULL, NULL
+ 	},
+ 	{
+ 		{"cpu_tuple_cost", PGC_USERSET, QUERY_TUNING_COST,
+diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
+index e1f5ab6..be7072a 100644
+--- a/src/backend/utils/misc/postgresql.conf.sample
++++ b/src/backend/utils/misc/postgresql.conf.sample
+@@ -223,8 +223,10 @@
+ 
+ # - Planner Cost Constants -
+ 
+-#seq_page_cost = 1.0			# measured on an arbitrary scale
+-#random_page_cost = 4.0			# same scale as above
++#seq_read_page_cost = 1.0		# measured on an arbitrary scale
++#random_read_page_cost = 4.0		# same scale as above
++#seq_write_page_cost = 1.0		# same scale as above
++#random_write_page_cost = 4.0		# same scale as above
+ #cpu_tuple_cost = 0.01			# same scale as above
+ #cpu_index_tuple_cost = 0.005		# same scale as above
+ #cpu_operator_cost = 0.0025		# same scale as above
+diff --git a/src/bin/psql/tab-complete.c b/src/bin/psql/tab-complete.c
+index e79e1e8..e176f79 100644
+--- a/src/bin/psql/tab-complete.c
++++ b/src/bin/psql/tab-complete.c
+@@ -1209,7 +1209,7 @@ psql_completion(char *text, int start, int end)
+ 			 pg_strcasecmp(prev_wd, "(") == 0)
+ 	{
+ 		static const char *const list_TABLESPACEOPTIONS[] =
+-		{"seq_page_cost", "random_page_cost", NULL};
++		{"seq_read_page_cost", "random_read_page_cost", NULL};
+ 
+ 		COMPLETE_WITH_LIST(list_TABLESPACEOPTIONS);
+ 	}
+diff --git a/src/include/commands/tablespace.h b/src/include/commands/tablespace.h
+index 3d46eeb..b64811c 100644
+--- a/src/include/commands/tablespace.h
++++ b/src/include/commands/tablespace.h
+@@ -35,8 +35,8 @@ typedef struct xl_tblspc_drop_rec
+ typedef struct TableSpaceOpts
+ {
+ 	int32		vl_len_;		/* varlena header (do not touch directly!) */
+-	float8		random_page_cost;
+-	float8		seq_page_cost;
++	float8		random_read_page_cost;
++	float8		seq_read_page_cost;
+ } TableSpaceOpts;
+ 
+ extern void CreateTableSpace(CreateTableSpaceStmt *stmt);
+diff --git a/src/include/optimizer/cost.h b/src/include/optimizer/cost.h
+index ce9f3f5..581a3ec 100644
+--- a/src/include/optimizer/cost.h
++++ b/src/include/optimizer/cost.h
+@@ -21,8 +21,10 @@
+ /* defaults for costsize.c's Cost parameters */
+ /* NB: cost-estimation code should use the variables, not these constants! */
+ /* If you change these, update backend/utils/misc/postgresql.sample.conf */
+-#define DEFAULT_SEQ_PAGE_COST  1.0
+-#define DEFAULT_RANDOM_PAGE_COST  4.0
++#define DEFAULT_SEQ_READ_PAGE_COST  1.0
++#define DEFAULT_RANDOM_READ_PAGE_COST  4.0
++#define DEFAULT_SEQ_WRITE_PAGE_COST  1.0
++#define DEFAULT_RANDOM_WRITE_PAGE_COST  4.0
+ #define DEFAULT_CPU_TUPLE_COST	0.01
+ #define DEFAULT_CPU_INDEX_TUPLE_COST 0.005
+ #define DEFAULT_CPU_OPERATOR_COST  0.0025
+@@ -43,8 +45,10 @@ typedef enum
+  */
+ 
+ /* parameter variables and flags */
+-extern PGDLLIMPORT double seq_page_cost;
+-extern PGDLLIMPORT double random_page_cost;
++extern PGDLLIMPORT double seq_read_page_cost;
++extern PGDLLIMPORT double random_read_page_cost;
++extern PGDLLIMPORT double seq_write_page_cost;
++extern PGDLLIMPORT double random_write_page_cost;
+ extern PGDLLIMPORT double cpu_tuple_cost;
+ extern PGDLLIMPORT double cpu_index_tuple_cost;
+ extern PGDLLIMPORT double cpu_operator_cost;
+diff --git a/src/include/utils/spccache.h b/src/include/utils/spccache.h
+index 9b620ef..38a638c 100644
+--- a/src/include/utils/spccache.h
++++ b/src/include/utils/spccache.h
+@@ -13,7 +13,7 @@
+ #ifndef SPCCACHE_H
+ #define SPCCACHE_H
+ 
+-void get_tablespace_page_costs(Oid spcid, float8 *spc_random_page_cost,
+-						  float8 *spc_seq_page_cost);
++void get_tablespace_page_costs(Oid spcid, float8 *spc_random_read_page_cost,
++							   float8 *spc_seq_read_page_cost);
+ 
+ #endif   /* SPCCACHE_H */
+diff --git a/src/test/regress/input/tablespace.source b/src/test/regress/input/tablespace.source
+index dba96f4..399861e 100644
+--- a/src/test/regress/input/tablespace.source
++++ b/src/test/regress/input/tablespace.source
+@@ -2,10 +2,10 @@
+ CREATE TABLESPACE testspace LOCATION '@testtablespace@';
+ 
+ -- try setting and resetting some properties for the new tablespace
+-ALTER TABLESPACE testspace SET (random_page_cost = 1.0);
++ALTER TABLESPACE testspace SET (random_read_page_cost = 1.0);
+ ALTER TABLESPACE testspace SET (some_nonexistent_parameter = true);  -- fail
+-ALTER TABLESPACE testspace RESET (random_page_cost = 2.0); -- fail
+-ALTER TABLESPACE testspace RESET (random_page_cost, seq_page_cost); -- ok
++ALTER TABLESPACE testspace RESET (random_read_page_cost = 2.0); -- fail
++ALTER TABLESPACE testspace RESET (random_read_page_cost, seq_read_page_cost, random_write_page_cost, seq_write_page_cost); -- ok
+ 
+ -- create a schema we can use
+ CREATE SCHEMA testschema;
+diff --git a/src/test/regress/output/tablespace.source b/src/test/regress/output/tablespace.source
+index 1260c96..556a667 100644
+--- a/src/test/regress/output/tablespace.source
++++ b/src/test/regress/output/tablespace.source
+@@ -1,12 +1,12 @@
+ -- create a tablespace we can use
+ CREATE TABLESPACE testspace LOCATION '@testtablespace@';
+ -- try setting and resetting some properties for the new tablespace
+-ALTER TABLESPACE testspace SET (random_page_cost = 1.0);
++ALTER TABLESPACE testspace SET (random_read_page_cost = 1.0);
+ ALTER TABLESPACE testspace SET (some_nonexistent_parameter = true);  -- fail
+ ERROR:  unrecognized parameter "some_nonexistent_parameter"
+-ALTER TABLESPACE testspace RESET (random_page_cost = 2.0); -- fail
++ALTER TABLESPACE testspace RESET (random_read_page_cost = 2.0); -- fail
+ ERROR:  RESET must not include values for parameters
+-ALTER TABLESPACE testspace RESET (random_page_cost, seq_page_cost); -- ok
++ALTER TABLESPACE testspace RESET (random_read_page_cost, seq_read_page_cost, random_write_page_cost, seq_write_page_cost); -- ok
+ -- create a schema we can use
+ CREATE SCHEMA testschema;
+ -- try a table
+-- 
+2.4.10
+

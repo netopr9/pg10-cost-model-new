@@ -1,0 +1,68 @@
+Date: Wed, 2 Nov 2011 10:08:53 +0100
+Subject: [PATCH 6/9] Document new random_write_page_cost default
+
+Insert a rationale for the new default setting of 1.0 for
+random_write_page_cost in the documentation of that variable.
+
+Update the postgresql.conf.sample, which is used to populate
+newly created database directories, for the new default value.
+---
+ doc/src/sgml/config.sgml                      | 24 +++++++++++++++---------
+ src/backend/utils/misc/postgresql.conf.sample |  2 +-
+ 2 files changed, 16 insertions(+), 10 deletions(-)
+
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index 4fdd48b..e73fafc 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -2371,19 +2371,25 @@ SET ENABLE_SEQSCAN TO OFF;
+       <listitem>
+        <para>
+         Sets the planner's estimate of the cost of a non-sequentially-written
+-        disk page.  The default is 4.0, what assumes a symmetric performing
+-        storage device like a hard disk drive.
++        disk page.  The default is 1.0 to resemble the exact behavior of
++        previous PostgreSQL versions, which did not distinguish read and write
++        operations in their cost functions.
+        </para>
+        <tip>
+-        <para>When the database resides on a asymmetric memory device like a
+-		  flash SSD or an even more modern phase change memory device, you
+-		  should increase this value, to prefer plans, that do not write
+-		  intermediate results.  Random writes on such a device are usually
+-		  slower than sequential writes, so plans using such operations
+-		  intensively should be avoided.
++        <para>
++	 A more realistic default on a symmetric storage device like a hard
++	 disk drive would be 4.0, the same as random_read_page_cost.
++	</para>
++        <para>
++         When the database resides on a asymmetric memory device like a
++         flash SSD or an even more modern phase change memory device, you
++         should increase this value, to prefer plans, that do not write
++         intermediate results.  Random writes on such a device are usually
++         slower than sequential writes, so plans using such operations
++         intensively should be avoided.
+         </para>
+        </tip>
+-	   <para>
++       <para>
+         This value can be overridden for a particular tablespace by setting
+         the tablespace parameter of the same name
+         (see <xref linkend="sql-altertablespace">).
+diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
+index be7072a..033b460 100644
+--- a/src/backend/utils/misc/postgresql.conf.sample
++++ b/src/backend/utils/misc/postgresql.conf.sample
+@@ -226,7 +226,7 @@
+ #seq_read_page_cost = 1.0		# measured on an arbitrary scale
+ #random_read_page_cost = 4.0		# same scale as above
+ #seq_write_page_cost = 1.0		# same scale as above
+-#random_write_page_cost = 4.0		# same scale as above
++#random_write_page_cost = 1.0		# same scale as above
+ #cpu_tuple_cost = 0.01			# same scale as above
+ #cpu_index_tuple_cost = 0.005		# same scale as above
+ #cpu_operator_cost = 0.0025		# same scale as above
+-- 
+2.4.10
+

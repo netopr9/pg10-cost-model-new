@@ -1,0 +1,86 @@
+Date: Tue, 8 Feb 2011 01:30:35 +0100
+Subject: [PATCH 3/9] Use random_write_page_cost in cost functions
+
+The new random_write_page_cost parameter introduced by the recent
+commit, which split up page cost configuration into separate parameters
+for reading and writing, was unused, although there should be at least
+some random write operations involved in the aglorithms.  Therefore,
+this commit changes the cost functions of the sort and hashjoin
+algorithms to account for the amount of random writes these algorithms
+might produce.  Experiments done with blktrace support the choices for
+the proportion of randomness that is assumed.
+
+For the sort algorithm all but the first merge phase of an external sort
+is assumed to have a 50:50 random-to-sequential write ratio.  The first
+phases is still treated to produce sequential writes only.  The
+randomness in the merge phase results from internal fragmentation within
+the simulated file system that is used to store the sorted runs.  As
+free blocks from various "tapes" are quickly re-used to store the blocks
+of new sorted runs, these writes tend to seek more and more in the later
+phases of that polyphase merge sort.
+
+The change in the hash algorithm switches the previous assumption of
+100% sequential writes to the opposite assumption of 100% random writes.
+Observations obtained with blktrace show a totally randomized seek
+pattern.  The argument, that these are cached writes, which may be as
+cheap as sequential reads, that probably led to the previous parameter
+assignment, does not count anymore.  With the split cost parameters it
+is now possible to treat writes separately.  Even if cached random
+writes were as cheap as sequential reads, it is now possible to
+configure that explicitely.
+---
+ src/backend/optimizer/path/costsize.c | 23 +++++++++++++++--------
+ 1 file changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
+index 7a3beaa..1cce7e1 100644
+--- a/src/backend/optimizer/path/costsize.c
++++ b/src/backend/optimizer/path/costsize.c
+@@ -1177,9 +1177,12 @@ cost_sort(Path *path, PlannerInfo *root,
+ 			log_runs = ceil(log(nruns) / log(mergeorder));
+ 		else
+ 			log_runs = 1.0;
+-		/* Assume all writes as sequential as they go to a single target
+-		 * tape. */
+-		startup_cost += npages * log_runs * seq_write_page_cost;
++		/* The writes of the "build runs" phase are sequential.  Later on in
++		 * the merge phase they are random half sequential because of
++		 * fragmentation. */
++		startup_cost += npages * seq_write_page_cost +
++				(npages * (log_runs-1.0) *
++				 (seq_write_page_cost + random_write_page_cost) * 0.5);
+ 		/* Assume half of reads as sequential and the other half as random.
+ 		 * They tend to start mostly sequential but more random in later runs
+ 		 * because of fragmentation in the temp file. */
+@@ -2159,9 +2162,13 @@ cost_hashjoin(HashPath *path, PlannerInfo *root, SpecialJoinInfo *sjinfo)
+ 	/*
+ 	 * If inner relation is too big then we will need to "batch" the join,
+ 	 * which implies writing and reading most of the tuples to disk an extra
+-	 * time.  Charge seq_*_page_cost per page, since the I/O should be nice
+-	 * and sequential.  Writing the inner rel counts as startup cost, all the
+-	 * rest as run cost.
++	 * time.  Charge random_write_cost per page because writes go to multiple
++	 * open files and only one block at a time.  The reads, however, will be
++	 * sequential in a batch with one random read for the first page of a
++	 * batch, but as the batches are of up to work_mem size this single random
++	 * read does not count much, so ignore it for now to keep the cost results
++	 * of the default configuration unchanged.  Writing the inner rel counts
++	 * as startup cost, all the rest as run cost.
+ 	 */
+ 	if (numbatches > 1)
+ 	{
+@@ -2170,9 +2177,9 @@ cost_hashjoin(HashPath *path, PlannerInfo *root, SpecialJoinInfo *sjinfo)
+ 		double		innerpages = page_size(inner_path_rows,
+ 										   inner_path->parent->width);
+ 
+-		startup_cost += seq_write_page_cost * innerpages;
++		startup_cost += random_write_page_cost * innerpages;
+ 		run_cost += seq_read_page_cost * innerpages +
+-				(seq_write_page_cost + seq_read_page_cost) * outerpages;
++				(random_write_page_cost + seq_read_page_cost) * outerpages;
+ 	}
+ 
+ 	/* CPU costs */
+-- 
+2.4.10
+

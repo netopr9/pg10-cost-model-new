@@ -1,0 +1,58 @@
+Date: Mon, 16 May 2011 13:47:45 +0200
+Subject: [PATCH 8/9] Assume writes in hashjoin as being sequential
+
+This is motivated by multiple observations.  First, this already was the
+case before the recent modification (so this is kind of a revert).
+Secondly, this matches with indications from Chinner and Higdon about
+missing fragmentation prevention in the ext3 filesystem, which generally
+is a prefereable choice for PostgreSQL according various other sources.
+Thirdly, this may be a measure against semantically wrong results from a
+calibration run on DBT-3.
+---
+ src/backend/optimizer/path/costsize.c | 22 +++++++++++++---------
+ 1 file changed, 13 insertions(+), 9 deletions(-)
+
+diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
+index 1cce7e1..7fda909 100644
+--- a/src/backend/optimizer/path/costsize.c
++++ b/src/backend/optimizer/path/costsize.c
+@@ -2162,13 +2162,17 @@ cost_hashjoin(HashPath *path, PlannerInfo *root, SpecialJoinInfo *sjinfo)
+ 	/*
+ 	 * If inner relation is too big then we will need to "batch" the join,
+ 	 * which implies writing and reading most of the tuples to disk an extra
+-	 * time.  Charge random_write_cost per page because writes go to multiple
+-	 * open files and only one block at a time.  The reads, however, will be
+-	 * sequential in a batch with one random read for the first page of a
+-	 * batch, but as the batches are of up to work_mem size this single random
+-	 * read does not count much, so ignore it for now to keep the cost results
+-	 * of the default configuration unchanged.  Writing the inner rel counts
+-	 * as startup cost, all the rest as run cost.
++	 * time.  Charge seq_write_page_cost per page, because tuples are
++	 * sequentially appended to the end of the temp files.  If multiple temp
++	 * files are used, this may be more randomly, but still these are buffered
++	 * writes, which may be grouped by the operating system, resulting in a
++	 * sequentialized pattern.  Although the reads should be considered as
++	 * random in that case, these can be optimized by OS read ahead logic and
++	 * so are faster than real random reads.  So count them as sequential.
++	 * The initial access to each batch should be really considered as random,
++	 * but its only a single access per batch.  The first access of a
++	 * sequential scan is not considered as random, too.  Writing the inner
++	 * relation counts as startup cost, all the rest as run cost.
+ 	 */
+ 	if (numbatches > 1)
+ 	{
+@@ -2177,9 +2181,9 @@ cost_hashjoin(HashPath *path, PlannerInfo *root, SpecialJoinInfo *sjinfo)
+ 		double		innerpages = page_size(inner_path_rows,
+ 										   inner_path->parent->width);
+ 
+-		startup_cost += random_write_page_cost * innerpages;
++		startup_cost += seq_write_page_cost * innerpages;
+ 		run_cost += seq_read_page_cost * innerpages +
+-				(random_write_page_cost + seq_read_page_cost) * outerpages;
++				(seq_write_page_cost + seq_read_page_cost) * outerpages;
+ 	}
+ 
+ 	/* CPU costs */
+-- 
+2.4.10
+

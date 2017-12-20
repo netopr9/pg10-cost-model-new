@@ -1,0 +1,29 @@
+Date: Tue, 8 Feb 2011 01:40:33 +0100
+Subject: [PATCH 4/9] Adapt random_write_page_cost default
+
+This new factor is used in places of the former seq_page_cost and so it
+should have the default value of that (1.0).  That way former cost
+values of all algorithms are reproduced in a default configuration.
+This provides a simple migration path for users of the default
+configuration, because the optimizer behavior will not change and it
+will select the same plans as the user was used to get before.
+---
+ src/include/optimizer/cost.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/include/optimizer/cost.h b/src/include/optimizer/cost.h
+index 581a3ec..1b9955b 100644
+--- a/src/include/optimizer/cost.h
++++ b/src/include/optimizer/cost.h
+@@ -24,7 +24,7 @@
+ #define DEFAULT_SEQ_READ_PAGE_COST  1.0
+ #define DEFAULT_RANDOM_READ_PAGE_COST  4.0
+ #define DEFAULT_SEQ_WRITE_PAGE_COST  1.0
+-#define DEFAULT_RANDOM_WRITE_PAGE_COST  4.0
++#define DEFAULT_RANDOM_WRITE_PAGE_COST  1.0
+ #define DEFAULT_CPU_TUPLE_COST	0.01
+ #define DEFAULT_CPU_INDEX_TUPLE_COST 0.005
+ #define DEFAULT_CPU_OPERATOR_COST  0.0025
+-- 
+2.4.10
+
